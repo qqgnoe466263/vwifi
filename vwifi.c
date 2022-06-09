@@ -18,10 +18,6 @@ MODULE_DESCRIPTION("virtual cfg80211 driver");
 
 #define MAX_PROBED_SSIDS 69
 
-#ifndef DEFAULT_SSID_LIST
-#define DEFAULT_SSID_LIST "[MyHomeWiFi]"
-#endif
-
 #define SCAN_TIMEOUT_MS 100 /*< millisecond */
 
 struct owl_packet {
@@ -66,6 +62,8 @@ struct owl_vif {
     unsigned long active_time; /* last tx/rx time (in jiffies) */
     u16 disconnect_reason_code;
 
+    bool started; /* for AP mdoe */
+
     struct mutex lock;
     struct timer_list scan_timeout;
     struct work_struct ws_connect, ws_disconnect;
@@ -78,23 +76,9 @@ struct owl_vif {
     struct list_head list;
 };
 
-/* AP information table entry */
-struct ap_info_entry_t {
-    struct hlist_node node;
-    u8 bssid[ETH_ALEN];
-    char ssid[IEEE80211_MAX_SSID_LEN];
-};
-
-static char *ssid_list = DEFAULT_SSID_LIST;
-module_param(ssid_list, charp, 0644);
-MODULE_PARM_DESC(ssid_list, "Self-defined SSIDs.");
-
 static int interfaces = 2;
 module_param(interfaces, int, 0444);
 MODULE_PARM_DESC(interfaces, "Number of virtual interfaces.");
-
-/* AP database */
-static DECLARE_HASHTABLE(ssid_table, 4);
 
 /* Global context */
 static struct owl_context *owl = NULL;
@@ -167,89 +151,31 @@ static inline uint64_t murmurhash(const char *str)
     return h;
 }
 
-/* Helper function for generating BSSID from SSID */
-static void generate_bssid_with_ssid(u8 *result, const char *ssid)
-{
-    u64_to_ether_addr(murmurhash(ssid), result);
-    result[0] &= 0xfe; /* clear multicast bit */
-    result[0] |= 0x02; /* set local assignment bit */
-}
-
-/* Update AP database from module parameter ssid_list */
-static void update_ssids(const char *ssid_list)
-{
-    struct ap_info_entry_t *ap;
-    const char delims[] = "[]";
-    struct hlist_node *tmp;
-
-    for (char *s = (char *) ssid_list; *s != 0; /*empty*/) {
-        bool ssid_exist = false;
-        char token[IEEE80211_MAX_SSID_LEN] = {0};
-
-        /* Get the number of token separator characters. */
-        size_t n = strspn(s, delims);
-        s += n; /* Actually skip the separators */
-        /* Get the number of token (non-separator) characters. */
-        n = strcspn(s, delims);
-        if (n == 0)  // token not found
-            continue;
-        strncpy(token, s, n);
-        s += n; /* Point the next token */
-
-        /* Insert the SSID into hash */
-        token[n] = '\0';
-        u32 key = murmurhash((char *) token);
-        hash_for_each_possible_safe (ssid_table, ap, tmp, node, key) {
-            if (strncmp(token, ap->ssid, n) == 0) {
-                ssid_exist = true;
-                break;
-            }
-        }
-        if (ssid_exist) /* SSID exists */
-            continue;
-
-        ap = kzalloc(sizeof(struct ap_info_entry_t), GFP_KERNEL);
-        if (!ap) {
-            pr_err("Failed to alloc ap_info_entry_t incomming SSID=%s\n",
-                   token);
-            return;
-        }
-        u8 bssid[ETH_ALEN] = {0};
-        strncpy(ap->ssid, token, n);
-        generate_bssid_with_ssid(bssid, token);
-        memcpy(ap->bssid, bssid, ETH_ALEN);
-        hash_add(ssid_table, &ap->node, key);
-    }
-}
-
 /* Helper function that will prepare structure with self-defined BSS information
  * and "inform" the kernel about "new" BSS Most of the code are copied from the
  * upcoming inform_dummy_bss function.
  */
 static void inform_dummy_bss(struct owl_vif *vif)
 {
-    struct ap_info_entry_t *ap;
-    int i;
-    struct hlist_node *tmp;
+    struct owl_vif *item;
 
-    update_ssids(ssid_list);
-    if (hash_empty(ssid_table))
-        return;
+    list_for_each_entry (item, &owl->vif_list, list) {
+        if (!item->started)
+            continue;
 
-    hash_for_each_safe (ssid_table, i, tmp, ap, node) {
         struct cfg80211_bss *bss = NULL;
         struct cfg80211_inform_bss data = {
             /* the only channel */
-            .chan = &vif->wdev.wiphy->bands[NL80211_BAND_2GHZ]->channels[0],
+            .chan = &item->wdev.wiphy->bands[NL80211_BAND_2GHZ]->channels[0],
             .scan_width = NL80211_BSS_CHAN_WIDTH_20,
             .signal = rand_int_smooth(-100, -30, jiffies) * 100,
         };
 
-        size_t ssid_len = strlen(ap->ssid);
+        size_t ssid_len = strlen(item->ssid);
         u8 *ie = kmalloc((ssid_len + 3) * sizeof(ie), GFP_KERNEL);
         ie[0] = WLAN_EID_SSID;
         ie[1] = ssid_len;
-        memcpy(ie + 2, ap->ssid, ssid_len);
+        memcpy(ie + 2, item->ssid, ssid_len);
 
         /* Using CLOCK_BOOTTIME clock, which won't be affected by
          * changes in system time-of-day clock, and includes any time
@@ -260,8 +186,8 @@ static void inform_dummy_bss(struct owl_vif *vif)
 
         /* It is posible to use cfg80211_inform_bss() instead. */
         bss = cfg80211_inform_bss_data(
-            vif->wdev.wiphy, &data, CFG80211_BSS_FTYPE_UNKNOWN, ap->bssid, tsf,
-            WLAN_CAPABILITY_ESS, 100, ie, ssid_len + 2, GFP_KERNEL);
+            vif->wdev.wiphy, &data, CFG80211_BSS_FTYPE_UNKNOWN, item->bssid,
+            tsf, WLAN_CAPABILITY_ESS, 100, ie, ssid_len + 2, GFP_KERNEL);
 
         /* cfg80211_inform_bss_data() returns cfg80211_bss structure referefence
          * counter of which should be decremented if it is unused.
@@ -495,42 +421,17 @@ static void owl_scan_routine(struct work_struct *w)
     mod_timer(&vif->scan_timeout, jiffies + msecs_to_jiffies(SCAN_TIMEOUT_MS));
 }
 
-/* It checks SSID of the ESS to connect and informs the kernel that connection
- * is finished. It should call cfg80211_connect_bss() when connect is finished
- * or cfg80211_connect_timeout() when connect is failed. This module can connect
- * only to ESS with SSID equal to SSID_DUMMY value.
- * This routine is called through workqueue, when the kernel asks to connect
- * through cfg80211_ops.
- */
 static bool is_valid_ssid(const char *connecting_ssid)
 {
-    bool is_valid = false;
-    struct ap_info_entry_t *ap;
-    struct hlist_node *tmp;
+    struct owl_vif *item = NULL;
 
-    u32 key = murmurhash((char *) connecting_ssid);
-    hash_for_each_possible_safe (ssid_table, ap, tmp, node, key) {
-        if (!strcmp(connecting_ssid, ap->ssid)) {
-            is_valid = true;
-            break;
-        }
+    list_for_each_entry (item, &owl->vif_list, list) {
+        if (item->started &&
+            !strncmp(item->ssid, connecting_ssid, IEEE80211_MAX_SSID_LEN))
+            return true;
     }
 
-    return is_valid;
-}
-
-static void get_connecting_bssid(const char *connecting_ssid,
-                                 u8 *connecting_bssid)
-{
-    struct ap_info_entry_t *ap;
-    struct hlist_node *tmp;
-    u32 key = murmurhash((char *) connecting_ssid);
-    hash_for_each_possible_safe (ssid_table, ap, tmp, node, key) {
-        if (!strcmp(connecting_ssid, ap->ssid)) {
-            memcpy(connecting_bssid, ap->bssid, ETH_ALEN);
-            break;
-        }
-    }
+    return false;
 }
 
 static void owl_connect_routine(struct work_struct *w)
@@ -620,7 +521,7 @@ static int owl_connect(struct wiphy *wiphy,
                        struct net_device *dev,
                        struct cfg80211_connect_params *sme)
 {
-    struct owl_vif *vif = ndev_get_owl_vif(dev);
+    struct owl_vif *item, *vif = ndev_get_owl_vif(dev);
 
     printk(KERN_INFO "owl: owl_connect\n");
 
@@ -629,7 +530,14 @@ static int owl_connect(struct wiphy *wiphy,
 
     vif->sme_state = SME_CONNECTING;
     memcpy(vif->req_ssid, sme->ssid, IEEE80211_MAX_SSID_LEN);
-    get_connecting_bssid(vif->req_ssid, vif->req_bssid);
+    /* FIXME: sme->bssid should not be empty */
+    list_for_each_entry (item, &owl->vif_list, list) {
+        if (item->started &&
+            !strncmp(item->ssid, sme->ssid, IEEE80211_MAX_SSID_LEN)) {
+            memcpy(vif->req_bssid, item->bssid, ETH_ALEN);
+            break;
+        }
+    }
     mutex_unlock(&vif->lock);
 
     if (!schedule_work(&vif->ws_connect))
@@ -768,6 +676,8 @@ static struct wireless_dev *owl_interface_add(struct wiphy *wiphy, int if_idx)
     vif->conn_time = 0;
     vif->active_time = 0;
     vif->disconnect_reason_code = 0;
+    /* Initialize AP information */
+    vif->started = false;
 
     mutex_init(&vif->lock);
 
@@ -889,7 +799,10 @@ static int owl_start_ap(struct wiphy *wiphy,
 
     /* set AP SSID */
     memcpy(vif->ssid, settings->ssid, settings->ssid_len);
-    update_ssids(vif->ssid);
+    /* set AP BSSID */
+    memcpy(vif->bssid, ndev->dev_addr, ETH_ALEN);
+
+    vif->started = true;
 
     return 0;
 }
@@ -901,29 +814,18 @@ static int owl_stop_ap(struct wiphy *wiphy, struct net_device *ndev)
 {
     struct owl_vif *item, *vif = ndev_get_owl_vif(ndev);
 
-    struct ap_info_entry_t *ap;
-    struct hlist_node *tmp;
-    int i;
-
     pr_info("owl: stop acting in AP mode.\n");
-    if (hash_empty(ssid_table))
-        return -EINVAL;
 
-    hash_for_each_safe (ssid_table, i, tmp, ap, node) {
-        if (!strncmp(ap->bssid, vif->bssid, ETH_ALEN)) {
-            /* Remove AP from ssid_table by bssid */
-            hash_del(&ap->node);
-
-            list_for_each_entry (item, &owl->vif_list, list) {
-                if (!strncmp(vif->bssid, item->bssid, ETH_ALEN) &&
-                    item->sme_state == SME_CONNECTED)
-                    /* Disconnect STA if some STA connected to AP */
-                    schedule_work(&item->ws_disconnect);
-            }
-
-            break;
-        }
+    vif->started = false;
+    list_for_each_entry (item, &owl->vif_list, list) {
+        if (!strncmp(vif->bssid, item->bssid, ETH_ALEN) &&
+            item->sme_state == SME_CONNECTED)
+            /* Disconnect STA if some STA connected to AP */
+            schedule_work(&item->ws_disconnect);
     }
+
+    memset(vif->ssid, 0, IEEE80211_MAX_SSID_LEN);
+    memset(vif->bssid, 0, ETH_ALEN);
 
     return 0;
 }
